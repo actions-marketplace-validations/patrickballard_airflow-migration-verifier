@@ -95,6 +95,8 @@ def test_unpinned_cron_dags_are_caught(tmp_path):
     etl = res["dags"]["dags/etl_daily.py::etl_daily"]
     assert etl["imports"] and etl["render"] == "mismatch", etl
     assert "### ⚠️ Run dates will shift" in report and "dags/etl_daily.py" in report
+    # on Airflow 3's trigger timetables data_interval_start == data_interval_end (checked on 3.3.2)
+    assert "a task that processes the rows between them processes none" in report
 
 
 @needs_both
@@ -132,7 +134,7 @@ def test_removed_context_keys_left_in_python_are_listed(tmp_path):
     assert any("execution_date" in p.text and p.path == "dags/partitions.py" and p.line for p in strict_problems(res))
     assert "execution_date" in report.split("### Needs manual migration", 1)[1]
     # says what to write, not just that migrate mode would: the PR may be someone else's
-    assert any(m["path"] == "dags/partitions.py" and "write the line as `return context[\"logical_date\"].hour`"
+    assert any(m["path"] == "dags/partitions.py" and "write the line as `return (context.get(\"logical_date\") or context[\"dag_run\"].run_after).hour`"
                in m["reason"] for m in res["manual"])
 
 
@@ -219,3 +221,77 @@ def test_strict_fails_on_problems_only():
         "::error file=a,line=1,title=Airflow 3 migration::a:1: x"]
     assert annotation(type(problems[0])("d.py", 2, "100%: a\nb")) == (
         "::error file=d.py,line=2,title=Airflow 3 migration::d.py:2: 100%25: a%0Ab")
+
+
+def test_a_file_that_fails_on_airflow_2_too_is_not_an_airflow_3_problem(tmp_path, monkeypatch):
+    # found on real repos: a missing Variable, connection or package fails the import on both versions
+    from api_change_agent import verify as v
+    from api_change_agent.testrun import TestOutcome
+    write(tmp_path, "dags/needs_var.py", "from airflow.sdk import DAG, Variable\nDAG(Variable.get('X'), schedule=None)\n")
+    err = "KeyError: 'Variable X does not exist.'"
+    failed = TestOutcome("dag check", False, 1, frozenset({"dags/needs_var.py::import"}), True,
+                         ids=("dags/needs_var.py::import",), messages={"dags/needs_var.py::import": err})
+    monkeypatch.setattr(v, "_dag_check", lambda *a, **k: failed)
+    res, dags = v.verify(tmp_path, tmp_path, rules_path=AIRFLOW_RULES, venv=tmp_path / "af3",
+                         old_venv=tmp_path / "af2", log=lambda *_: None)
+    assert res.unverified == [] and "### ⚠️ Unverified files" not in res.body
+    assert any("doesn't import on Airflow 2 either" in s and "Variable X" in s for s in res.skipped)
+    summary = res.summary()
+    summary["dags"] = dags
+    assert v.strict_problems(summary) == []
+
+
+@pytest.mark.parametrize("airflow2, airflow3, env_only", [
+    # the same failure on both: the environment lacks something
+    ("KeyError: 'Variable X does not exist'", "KeyError: 'Variable X does not exist.'", True),
+    ("airflow.exceptions.AirflowNotFoundException: The conn_id `c` isn't defined",
+     "airflow.sdk.exceptions.AirflowNotFoundException: The conn_id `c` isn't defined", True),
+    # a library the environment can't run, in different places on each version
+    ("ImportError: cannot import name 'A' from 'kafka.errors' (/v/af2/kafka/errors.py)",
+     "ImportError: cannot import name 'B' from 'kafka.util' (/v/real-world-airflow/kafka/util.py)", True),
+    # Airflow 3 fails earlier, on something Airflow 3 changed: still an Airflow 3 problem
+    ("KeyError: 'Variable X does not exist'", "TypeError: DAG.__init__() got an unexpected keyword argument 'x'", False),
+    ("KeyError: 'Variable X does not exist'", "ModuleNotFoundError: No module named 'airflow.datasets'", False),
+    ("AirflowDagCycleException: Cycle detected in DAG: c", "ModuleNotFoundError: No module named 'airflow.operators.dummy'",
+     False),
+    # Airflow 3 rejects an operator argument: "Airflow" is part of the exception's name, not a word of its own
+    ("KeyError: 'Variable X does not exist'",
+     "AirflowException: Invalid arguments were passed to BashOperator (task_id: t). Invalid arguments were: "
+     "**kwargs: {'provide_context': True}", False),
+])
+def test_which_failures_on_both_versions_are_the_environment(airflow2, airflow3, env_only):
+    from api_change_agent.verify import environment_only
+    assert environment_only(airflow2, airflow3) is env_only
+
+
+SCHEDULES = ("import datetime\nfrom airflow.sdk import DAG\n"
+             "DAG('daily', schedule='@daily', start_date=datetime.datetime(2024, 1, 1))\n"
+             "DAG('six_hourly', schedule=datetime.timedelta(hours=6), start_date=datetime.datetime(2024, 1, 1))\n")
+
+
+@pytest.mark.parametrize("cfg, shifted, note", [
+    # on Airflow 3.3.2, create_cron_data_intervals picks the timetable for timedelta schedules too
+    ("[scheduler]\ncreate_cron_data_intervals = True\n", set(), False),
+    # and create_delta_data_intervals is never read (apache/airflow#69868): nothing is restored
+    ("[scheduler]\ncreate_delta_data_intervals = True\n", {"'@daily'", "datetime.timedelta(hours=6)"}, True),
+    ("", {"'@daily'", "datetime.timedelta(hours=6)"}, False),
+])
+def test_one_flag_decides_both_cron_and_timedelta_schedules(tmp_path, monkeypatch, cfg, shifted, note):
+    from api_change_agent import verify as v
+    from api_change_agent.testrun import TestOutcome
+    write(tmp_path, "dags/d.py", SCHEDULES)
+    if cfg:
+        write(tmp_path, "airflow.cfg", cfg)
+    ok = TestOutcome("dag check", True, 0, has_junit=True)
+    monkeypatch.setattr(v, "_dag_check", lambda *a, **k: ok)
+    res, _ = v.verify(tmp_path, tmp_path, rules_path=AIRFLOW_RULES, venv=tmp_path / "af3", old_venv=None,
+                      log=lambda *_: None)
+    assert {u["schedule"] for u in res.unpinned} == shifted
+    assert any("create_delta_data_intervals" in s and "69868" in s for s in res.skipped) is note
+    assert "create_delta_data_intervals = True" not in res.body.split("### ⚠️ Run dates will shift", 1)[-1][:900]
+
+
+def test_the_shift_warning_names_only_the_flag_airflow_3_reads():
+    from api_change_agent.report import _unpinned_section
+    text = "\n".join(_unpinned_section([{"path": "d.py", "line": 1, "schedule": "'@daily'", "reason": "x: y"}], None))
+    assert "create_cron_data_intervals = True" in text and "create_delta_data_intervals" not in text

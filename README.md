@@ -21,6 +21,8 @@ This GitHub Action checks a migration the same way, whoever made it: a person, r
 - ❌ [PR #1](https://github.com/patrickballard/airflow-verifier-trial/pull/1), migrated with ruff alone, **fails** ([run](https://github.com/patrickballard/airflow-verifier-trial/actions/runs/40110340024)). `{{ ds }}` renders a day later on 25 of 25 runs, `days_ago` no longer imports, and `context["execution_date"]` is still read.
 - ✅ [PR #5](https://github.com/patrickballard/airflow-verifier-trial/pull/5), opened by this action's migrate mode, **passes** ([run](https://github.com/patrickballard/airflow-verifier-trial/actions/runs/40110745663)).
 
+**Need it done for you?** The action is free and stays free. If you'd rather not run it yourself, I do a fixed-price [migration audit](https://patrickballard.github.io/airflow-migration-verifier/): every DAG checked on Airflow 2 and 3, a written fix list, two business days. I also do verified migration PRs.
+
 ## What it does
 
 1. **ruff's AIR3 fixes** (`--select AIR3 --preview`): imports, `schedule_interval`, moved operators. Every change ruff makes is credited in the PR table.
@@ -28,9 +30,9 @@ This GitHub Action checks a migration the same way, whoever made it: a person, r
 2. **What ruff misses:**
    - **Timetable pin.** `schedule="@daily"` becomes `CronDataIntervalTimetable("@daily", timezone=...)`, so runs keep their Airflow 2 dates.
      - The zone comes from the DAG's `start_date`, then `default_args`, then the repo's `default_timezone` (`airflow.cfg`, `.env`, docker-compose, Helm, Dockerfile).
-     - The PR also names the global alternative, `[scheduler] create_cron_data_intervals = True`.
+     - The PR also names the global alternative, `[scheduler] create_cron_data_intervals = True`. If the repo already sets it (same places as `default_timezone`), nothing is pinned and the PR says where it's set.
    - **`days_ago(N)`** becomes `pendulum.today("UTC").add(days=-N)`. That's the same moment, still computed at parse time. A fixed date would change scheduling and catchup.
-   - **Removed context keys,** in Python (`context["execution_date"]`) and in Jinja (operator strings, `.sql` / `.sh` / `.j2` files). They're rewritten only where Airflow's docs say the replacement is the same value: `execution_date` → `logical_date`, `yesterday_ds` → `macros.ds_add(ds, -1)`, …
+   - **Removed context keys,** in Python (`context["execution_date"]`) and in Jinja (operator strings, `.sql` / `.sh` / `.j2` files). They're rewritten only where the replacement is the same value: `yesterday_ds` → `macros.ds_add(ds, -1)`, … and `execution_date` → `context.get("logical_date") or context["dag_run"].run_after`. An Airflow 3 manual run can have no logical date; then the context has no `logical_date` key and `dag_run.logical_date` is `None`, so a plain `logical_date` would fail where Airflow 2 used the trigger time.
    - **Removed DAG methods** (`following_schedule`, `previous_schedule` and 50 others, checked against both versions) are flagged. A DAG that calls one still imports, then fails when the call runs.
    - **Judgment sites** (`next_ds`, `prev_ds`, computed schedules) go to Claude when you give it a key, with a hard spend cap. Otherwise they're listed for a human.
 3. **A render check that proves each change.**
@@ -112,7 +114,7 @@ With `strict: "true"` the check fails on any of these except the schedule list, 
 
 **What it builds:** an Airflow 3 venv from the head's requirements, and an Airflow 2 venv at the base's `apache-airflow` pin (2.11.2 if there's none).
 
-**Scheduler setting:** if the head sets `[scheduler] create_cron_data_intervals = True`, in `airflow.cfg`, an env file, compose, a Dockerfile or Helm values, it's respected. That's the global way to keep Airflow 2's run dates.
+**Scheduler setting:** if the head sets `[scheduler] create_cron_data_intervals = True`, in `airflow.cfg`, an env file, compose, a Dockerfile or Helm values, it's respected. That's the global way to keep Airflow 2's run dates. On Airflow 3 it covers timedelta schedules too; `create_delta_data_intervals` is never read ([apache/airflow#69868](https://github.com/apache/airflow/issues/69868)), so setting only that one changes nothing.
 
 ### Migrate your repo
 
@@ -187,9 +189,40 @@ python -m api_change_agent --repo . --rules airflow --dry-run --output out --ins
 python -m api_change_agent verify --before ../before --after . --install-command auto --output out
 ```
 
+## Check the output too
+
+The render check compares what your tasks are told to do. To see what they actually write, run the same DAGs on both versions and diff the output. It has to be a live side-by-side run, because a backfill won't show the date shift.
+
+**Why a backfill won't show it.** Over a date range, both versions create runs with the same logical dates. What changes is when each run fires:
+
+| `@daily` run with `ds=2024-05-01` | Data interval | Fires at |
+|---|---|---|
+| Airflow 2.11.2 | 05-01 00:00 → 05-02 00:00 | 2024-05-02 00:00, after the day is over |
+| Airflow 3.3.2 | 05-01 00:00 → 05-01 00:00 | 2024-05-01 00:00, as the day starts |
+
+A backfill runs after all the data already exists, so both versions read complete days and agree. The only difference that shows up is reads that use the data interval, which come back empty on Airflow 3. `airflow dags test <dag_id> <date>` hides the shift the same way, because it sets the logical date directly.
+
+**The side-by-side run:**
+
+1. Set up two staging environments: your current 2.x, and 3.x with the migrated code. Give them the same source, but separate output locations (for example `s3://bucket/af2/` and `s3://bucket/af3/`). A local docker-compose Airflow is enough.
+2. Feed the source rows as time passes. Give each row an ID, and include rows just before and just after each boundary in the DAG's timezone: midnight for daily DAGs, the hour for hourly ones.
+3. Unpause the DAGs on both environments at the same time with `catchup=False`, and let at least two scheduled runs fire.
+4. On each environment, trigger one manual run without a logical date: `airflow dags trigger <dag_id>`.
+5. For each partition, compare row counts and row IDs. They should match exactly.
+
+What a difference usually means:
+
+| On Airflow 3 | Likely cause |
+|---|---|
+| Partition empty or short, run green | The task reads a day or hour that has only just started, or uses the zero-length data interval |
+| Same rows, partition dated one interval later | The path is built from `ds` or `logical_date`, while the rows are selected some other way, such as everything since the last run |
+| Manual run fails with `KeyError`, `UndefinedError` or `AttributeError` | Code reads `logical_date` or `ds`, which a manual run with no logical date doesn't have (see [the fallback](#what-it-does)) |
+
+Setting `[scheduler] create_cron_data_intervals = True` on the 3.x environment, or pinning `CronDataIntervalTimetable`, should get rid of the first two. Re-run the check to confirm. Weekly and monthly schedules are too slow to run live, so for those, rely on the render check.
+
 ## Limitations
 
-- **Python context reads aren't render-checked.** `context["execution_date"]` → `context["logical_date"]` is the documented equivalent, but only templates are rendered and compared. In Airflow 3 a manually triggered run can have no logical date; migrate mode's PR lists each such site with a one-line fallback.
+- **Python context reads aren't render-checked.** Only templates are rendered and compared. The `execution_date` rewrite keeps a fallback for manual runs with no logical date; if Claude's patch reads `logical_date` without one, migrate mode's PR lists the line with the fix.
 - **Some things are always manual:**
   - operators removed from their providers (`PostgresOperator`, `SnowflakeOperator`, `SubDagOperator`, …);
   - `prev_ds` / `next_ds` without a key;
@@ -211,7 +244,7 @@ python -m api_change_agent verify --before ../before --after . --install-command
 
 ### Why not just set `create_cron_data_intervals = True`?
 
-You can, and verify mode respects it when your repo sets it. But:
+You can, and both modes respect it when your repo sets it: verify mode renders with it, and migrate mode then pins nothing. But:
 - **It has to be set before you upgrade.** Once a DAG has runs from Airflow 3's default `CronTriggerTimetable`, switching it to `CronDataIntervalTimetable` skips one scheduled run ([apache/airflow#66441](https://github.com/apache/airflow/pull/66441) documents this). The per-DAG pin this action writes follows the same rule: merge it together with the upgrade, not after it.
 - **It only keeps the run dates.** `days_ago`, `execution_date` and the other removed context keys, removed DAG methods, and arguments Airflow 3 rejects all still break. The verifier checks those too.
 
@@ -241,6 +274,8 @@ What they do better:
 - **Python context reads**, such as `context["execution_date"]` in a callable. They're rewritten where Airflow documents the same value, and listed, but not run and compared.
 - **Runtime-only behaviour:** XCom values, what tasks do with connections and external systems, and DAGs that need a connection, variable or private package just to import. Those are reported as unverified.
 
+To check what your tasks actually write, see [Check the output too](#check-the-output-too).
+
 More under [Limitations](#limitations).
 
 ## Also: OpenAI Python SDK rules
@@ -260,6 +295,10 @@ CI (unit tests on Python 3.10–3.12, the real-Airflow integration tests and the
 pip install -e '.[test]' && pytest
 ACA_AIRFLOW2_VENV=.../airflow-2 ACA_AIRFLOW3_VENV=.../airflow-3 pytest   # + real-Airflow integration tests
 ```
+
+## License
+
+MIT. See [LICENSE](LICENSE).
 
 ---
 
